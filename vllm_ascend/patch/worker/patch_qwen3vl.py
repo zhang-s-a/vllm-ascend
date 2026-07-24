@@ -158,11 +158,23 @@ def _sp_vision_transformer_forward(
     tp_rank = get_tensor_model_parallel_rank()
     total_seq = hidden_states.shape[0]
 
+    # --- SP pre-condition: total_seq must be divisible by tp_size ---
+    # Vision tokens per image are multiples of spatial_merge_size^2 (=4),
+    # so tp_size 2/4 always divide. For tp_size >= 8, fall back to original
+    # forward when not divisible (avoids complex cu_seqlens padding).
+    if total_seq % tp_size != 0:
+        return _orig_vision_transformer_forward(
+            self, x, grid_thw, encoder_metadata=encoder_metadata
+        )
+
     # --- SP entry padding ---
     # total_seq may not be divisible by tp_size. Pad with zeros so each rank
     # gets an equal-sized shard. The padded tokens' outputs are discarded.
     padded_seq = ((total_seq + tp_size - 1) // tp_size) * tp_size
     if padded_seq != total_seq:
+        # Shallow-copy metadata dict so we don't mutate the caller's copy
+        # (the same metadata may be reused across forward calls, e.g. cudagraph).
+        encoder_metadata = dict(encoder_metadata)
         pad_len = padded_seq - total_seq
         hidden_states = torch.nn.functional.pad(
             hidden_states, (0, 0, 0, 0, 0, pad_len)
@@ -178,6 +190,12 @@ def _sp_vision_transformer_forward(
         if sin is not None and sin.shape[0] == total_seq:
             sin_pad = sin[-1:].expand(pad_len, -1)
             encoder_metadata["rotary_pos_emb_sin"] = torch.cat([sin, sin_pad], dim=0)
+        # NOTE: cu_seqlens is NOT padded here. This is safe because the
+        # non-divisible fallback above ensures we only reach the padding
+        # branch when total_seq IS divisible (padded_seq == total_seq).
+        # If future work removes the fallback and needs cu_seqlens padding,
+        # a dummy segment must be appended to prevent FA backends from
+        # asserting on token-count mismatch.
 
     # SP entry: split sequence evenly across TP ranks
     local_seq = padded_seq // tp_size
@@ -197,9 +215,14 @@ def _sp_vision_transformer_forward(
             sequence_lengths=encoder_metadata.get("sequence_lengths"),
         )
         if layer_num in self.deepstack_visual_indexes:
-            # Deepstack mergers require full_seq. AllGather temporarily,
-            # run merger, then continue with local_seq.
+            # Deepstack mergers require full_seq (they reshape by
+            # spatial_merge_size). AllGather, TRIM padding to total_seq,
+            # then run merger. Trimming is critical: without it, the merger
+            # produces padded_seq/4 tokens while the final merger produces
+            # total_seq/4, causing torch.cat dim=0 mismatch.
             full_hs = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            if padded_seq != total_seq:
+                full_hs = full_hs[:total_seq]
             deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
             deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
                 full_hs
@@ -314,7 +337,10 @@ def _sp_vision_mlp_forward(self, x):
     SP flow (TP+SP):
         x [local_seq] -> AllGather+linear_fc1 -> act_fn -> linear_fc2+ReduceScatter -> [local_seq]
     """
-    from vllm_ascend.ops.vision_sp_strategy import get_vision_sp_strategy
+    from vllm_ascend.ops.vision_sp_strategy import (
+        get_vision_sp_strategy,
+        vision_matmul_and_reducescatter,
+    )
 
     strategy = get_vision_sp_strategy()
     # x: [local_seq, 1, hidden]
@@ -325,7 +351,8 @@ def _sp_vision_mlp_forward(self, x):
     act_out = self.act_fn(up_out)
     # [full_seq, 1, local_ffn_dim]
     # Step 3: FFN Down & ReduceScatter
-    down_out = strategy.matmul_and_reducescatter(act_out, self.linear_fc2)
+    #   Standalone function (no fused version planned for ReduceScatter)
+    down_out = vision_matmul_and_reducescatter(act_out, self.linear_fc2)
     # [local_seq, 1, hidden]
     return down_out
 

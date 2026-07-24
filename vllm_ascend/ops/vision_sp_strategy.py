@@ -16,11 +16,14 @@
 #
 """VIT Sequence Parallelism (TP+SP hybrid) strategy interface.
 
-Defines ``VisionSPStrategy`` — an abstract interface with 3 methods that the
+Defines ``VisionSPStrategy`` — an abstract interface with 2 methods that the
 Forward patches call. Phase 1 implements ``NaiveVisionSPStrategy`` (sequential
 comm + matmul using existing primitives). Phase 2 will implement
 ``FusedVisionSPStrategy`` (fused comm+matmul ops for 通算掩盖). The Forward
 code is identical for both phases — only the strategy implementation changes.
+
+``matmul_and_reducescatter`` is a standalone function (not part of the
+strategy interface) because no fused version is planned for ReduceScatter.
 """
 
 from __future__ import annotations
@@ -40,10 +43,9 @@ from vllm.distributed.utils import split_tensor_along_last_dim
 class VisionSPStrategy(ABC):
     """Abstract interface for VIT SP communication strategy.
 
-    Forward patches call these 3 methods. The strategy handles all
-    communication (AllGather / AllToAll / AllReduce / ReduceScatter)
-    and matmul (via ``layer.quant_method.apply``), so the Forward code
-    is the same regardless of whether comm+matmul are fused or sequential.
+    Forward patches call these 2 methods for the attention path (AllGather+
+    matmul and AllToAll+matmul+reduce). The MLP path uses
+    ``vision_matmul_and_reducescatter`` directly (no strategy, no fused plan).
     """
 
     @abstractmethod
@@ -58,6 +60,12 @@ class VisionSPStrategy(ABC):
             layer:  ColumnParallelLinear / QKVParallelLinear
         Returns:
             [full_seq, ..., out_features_per_partition]
+
+        Note: assumes ``layer.quant_method.apply`` returns a single tensor
+        (not a tuple). This holds when ``return_bias=False`` and
+        ``skip_bias_add=False``, which is the case for all current Qwen3-VL
+        vision layers. If a future layer uses ``skip_bias_add=True`` with a
+        real bias, this method would need to unpack the tuple and add bias.
         """
 
     @abstractmethod
@@ -72,21 +80,38 @@ class VisionSPStrategy(ABC):
             layer:  RowParallelLinear
         Returns:
             [local_seq, ..., hidden]
+
+        Note: same ``quant_method.apply`` assumption as above.
         """
 
-    @abstractmethod
-    def matmul_and_reducescatter(
-        self, input_: torch.Tensor, layer
-    ) -> torch.Tensor:
-        """Row-parallel matmul + ReduceScatter(seq dim=0).
 
-        Used for FFN Down (linear_fc2).
-        Args:
-            input_: [full_seq, ..., local_ffn_dim]
-            layer:  RowParallelLinear
-        Returns:
-            [local_seq, ..., hidden]
-        """
+def vision_matmul_and_reducescatter(
+    input_: torch.Tensor, layer
+) -> torch.Tensor:
+    """Row-parallel matmul + ReduceScatter(seq dim=0).
+
+    Standalone function — not part of VisionSPStrategy because no fused
+    version is planned for ReduceScatter. Uses existing primitives directly.
+
+    Used for FFN Down (linear_fc2).
+    Args:
+        input_: [full_seq, ..., local_ffn_dim]
+        layer:  RowParallelLinear
+    Returns:
+        [local_seq, ..., hidden]
+    """
+    tp_rank = get_tp_group().rank_in_group
+    # Row-parallel matmul: bias only on rank 0 to avoid double-add after
+    # ReduceScatter (ReduceScatter sums across ranks).
+    bias_ = (
+        None
+        if (tp_rank > 0 or getattr(layer, "skip_bias_add", False))
+        else layer.bias
+    )
+    output_parallel = layer.quant_method.apply(layer, input_, bias_)
+    # ReduceScatter on seq dim: [full_seq, ...] -> [local_seq, ...]
+    output = tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
+    return output
 
 
 class NaiveVisionSPStrategy(VisionSPStrategy):
@@ -128,19 +153,6 @@ class NaiveVisionSPStrategy(VisionSPStrategy):
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output
 
-    def matmul_and_reducescatter(self, input_, layer):
-        tp_rank = get_tp_group().rank_in_group
-        # 1. Row-parallel matmul (partial result on full_seq)
-        bias_ = (
-            None
-            if (tp_rank > 0 or getattr(layer, "skip_bias_add", False))
-            else layer.bias
-        )
-        output_parallel = layer.quant_method.apply(layer, input_, bias_)
-        # 2. ReduceScatter on seq dim: [full_seq, ...] -> [local_seq, ...]
-        output = tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
-        return output
-
 
 _strategy_instance: VisionSPStrategy | None = None
 
@@ -162,6 +174,12 @@ def get_vision_sp_strategy() -> VisionSPStrategy:
     return _strategy_instance
 
 
+def clear_vision_sp_strategy():
+    """Reset the strategy singleton. Called from clear_enable_sp()."""
+    global _strategy_instance
+    _strategy_instance = None
+
+
 class FusedVisionSPStrategy(VisionSPStrategy):
     """Phase 2: fused comm+matmul (通算掩盖). Interface is identical to Naive.
 
@@ -172,8 +190,9 @@ class FusedVisionSPStrategy(VisionSPStrategy):
     Reference implementations:
     - allgather_and_matmul: see SequenceColumnParallelOp (linear_op.py:288)
     - alltoall_matmul_reduce: see OProjRowParallelOp (linear_op.py:239)
-    - matmul_and_reducescatter: see SequenceRowParallelOp.matmul_and_reduce
-      (linear_op.py:371-412), uses npu_mm_reduce_scatter_base
+
+    Note: matmul_and_reducescatter is NOT part of this strategy — it uses
+    existing ReduceScatter directly (no fused version planned).
     """
 
     def allgather_and_matmul(self, input_, layer):
@@ -183,12 +202,6 @@ class FusedVisionSPStrategy(VisionSPStrategy):
         )
 
     def alltoall_matmul_reduce(self, input_, layer):
-        raise NotImplementedError(
-            "FusedVisionSPStrategy is Phase 2. Set VLLM_ASCEND_ENABLE_VISION_SP_FUSED=0"
-            " to use NaiveVisionSPStrategy (Phase 1)."
-        )
-
-    def matmul_and_reducescatter(self, input_, layer):
         raise NotImplementedError(
             "FusedVisionSPStrategy is Phase 2. Set VLLM_ASCEND_ENABLE_VISION_SP_FUSED=0"
             " to use NaiveVisionSPStrategy (Phase 1)."
