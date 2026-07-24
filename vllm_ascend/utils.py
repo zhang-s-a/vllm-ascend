@@ -143,6 +143,13 @@ def clear_enable_sp():
     enable_dsa_cp.cache_clear()
     enable_dsa_cp_with_o_proj_tp.cache_clear()
     _libc_getenv.cache_clear()
+    # Reset the vision SP strategy singleton so that flag changes take effect
+    try:
+        from vllm_ascend.ops.vision_sp_strategy import clear_vision_sp_strategy
+
+        clear_vision_sp_strategy()
+    except ImportError:
+        pass
 
 
 def is_310p():
@@ -924,7 +931,27 @@ def enable_vision_sp(vllm_config=None) -> bool:
             except RuntimeError:
                 _ENABLE_VISION_SP = envs_ascend.VLLM_ASCEND_ENABLE_VISION_SP
 
-    return bool(_ENABLE_VISION_SP)
+    if not bool(_ENABLE_VISION_SP):
+        return False
+
+    # SP requires tp_size > 1 (SP reuses the TP communication group)
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    if get_tensor_model_parallel_world_size() <= 1:
+        return False
+
+    # SP is incompatible with VIT data-parallel mode (disable_tp=True means
+    # weights are not sharded, so AllGather/AllToAll on the TP group would
+    # produce garbage). Auto-disable in that case.
+    try:
+        from vllm.model_executor.models.vision import is_vit_use_data_parallel
+
+        if is_vit_use_data_parallel():
+            return False
+    except Exception:
+        pass
+
+    return True
 
 
 def enable_vision_sp_fused() -> bool:
