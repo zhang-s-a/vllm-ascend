@@ -29,22 +29,53 @@ strategy interface) because no fused version is planned for ReduceScatter.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from abc import ABC, abstractmethod
 
 from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.distributed.utils import split_tensor_along_last_dim
+
+
+_full_weight_cache: dict[int, torch.Tensor] = {}
+
+
+def clear_full_weight_cache() -> None:
+    """Clear cached AllGathered o_proj weights.
+
+    Must be called after weight updates (e.g., RL weight transfer) to
+    invalidate stale cached full weights.
+    """
+    _full_weight_cache.clear()
+
+
+def _get_full_weight(layer) -> torch.Tensor:
+    """AllGather row-parallel weight shards to form the full o_proj weight.
+
+    Each rank holds [H, local_h*d]; AllGather along dim=-1 yields [H, N*d].
+    The result is cached per-layer for the lifetime of the process (inference
+    weights are immutable). Call clear_full_weight_cache() after weight updates.
+
+    NOTE: This bypasses ``quant_method.apply`` and uses ``F.linear`` directly.
+    This is correct for unquantized layers (the common case for ViT o_proj).
+    For quantized ViT layers, this would need to be extended.
+    """
+    key = id(layer)
+    cached = _full_weight_cache.get(key)
+    if cached is not None:
+        return cached
+    full_weight = tensor_model_parallel_all_gather(layer.weight, dim=-1)
+    _full_weight_cache[key] = full_weight
+    return full_weight
 
 
 class VisionSPStrategy(ABC):
     """Abstract interface for VIT SP communication strategy.
 
     Forward patches call these 2 methods for the attention path (AllGather+
-    matmul and AllToAll+matmul+reduce). The MLP path uses
+    matmul and AllToAll+matmul). The MLP path uses
     ``vision_matmul_and_reducescatter`` directly (no strategy, no fused plan).
     """
 
@@ -69,19 +100,20 @@ class VisionSPStrategy(ABC):
         """
 
     @abstractmethod
-    def alltoall_matmul_reduce(
+    def alltoall_matmul(
         self, input_: torch.Tensor, layer
     ) -> torch.Tensor:
-        """AllToAll(seq->head) + row-parallel matmul + AllReduce.
+        """AllToAll(seq->head) + full matmul with AllGathered weight.
 
-        Used for o_proj (proj).
+        Used for o_proj (proj). After AllToAll each rank holds all heads
+        for its local_seq. The o_proj weight shards are AllGathered (cached)
+        so each rank can compute the full output without AllReduce.
+
         Args:
             input_: [full_seq, ..., local_h*head_dim]  (FA output)
-            layer:  RowParallelLinear
+            layer:  RowParallelLinear (weight is AllGathered at runtime)
         Returns:
             [local_seq, ..., hidden]
-
-        Note: same ``quant_method.apply`` assumption as above.
         """
 
 
@@ -131,26 +163,19 @@ class NaiveVisionSPStrategy(VisionSPStrategy):
         output = layer.quant_method.apply(layer, full_input, bias)
         return output
 
-    def alltoall_matmul_reduce(self, input_, layer):
+    def alltoall_matmul(self, input_, layer):
         tp_group = get_tp_group()
-        tp_rank = tp_group.rank_in_group
-        tp_size = tp_group.world_size
         # 1. AllToAll: scatter seq (dim=0), gather head (dim=-1)
         #    [full_seq, ..., local_h*head_dim] -> [local_seq, ..., all_h*head_dim]
         gathered = tp_group.all_to_all(input_, scatter_dim=0, gather_dim=-1)
-        # 2. Split by head for row-parallel matmul (each rank takes its shard)
-        split = split_tensor_along_last_dim(gathered, tp_size)
-        local_input = split[tp_rank].contiguous()
-        # 3. Row-parallel matmul (bias only on rank 0 to avoid double-add
-        #    after AllReduce)
-        bias_ = (
-            None
-            if (tp_rank > 0 or getattr(layer, "skip_bias_add", False))
-            else layer.bias
-        )
-        output_parallel = layer.quant_method.apply(layer, local_input, bias_)
-        # 4. AllReduce to combine partial results
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        # 2. AllGather o_proj weight shards -> full weight [H, all_h*head_dim]
+        #    (cached per-layer; each rank holds [H, local_h*head_dim])
+        full_weight = _get_full_weight(layer)
+        # 3. Full matmul: all heads' contributions are summed in one matmul.
+        #    No AllReduce needed — each rank already has all heads for its
+        #    local_seq after AllToAll.
+        bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
+        output = F.linear(gathered, full_weight, bias)
         return output
 
 
@@ -178,6 +203,7 @@ def clear_vision_sp_strategy():
     """Reset the strategy singleton. Called from clear_enable_sp()."""
     global _strategy_instance
     _strategy_instance = None
+    clear_full_weight_cache()
 
 
 class FusedVisionSPStrategy(VisionSPStrategy):
@@ -189,7 +215,7 @@ class FusedVisionSPStrategy(VisionSPStrategy):
 
     Reference implementations:
     - allgather_and_matmul: see SequenceColumnParallelOp (linear_op.py:288)
-    - alltoall_matmul_reduce: see OProjRowParallelOp (linear_op.py:239)
+    - alltoall_matmul: see OProjRowParallelOp (linear_op.py:239)
 
     Note: matmul_and_reducescatter is NOT part of this strategy — it uses
     existing ReduceScatter directly (no fused version planned).
@@ -201,7 +227,7 @@ class FusedVisionSPStrategy(VisionSPStrategy):
             " to use NaiveVisionSPStrategy (Phase 1)."
         )
 
-    def alltoall_matmul_reduce(self, input_, layer):
+    def alltoall_matmul(self, input_, layer):
         raise NotImplementedError(
             "FusedVisionSPStrategy is Phase 2. Set VLLM_ASCEND_ENABLE_VISION_SP_FUSED=0"
             " to use NaiveVisionSPStrategy (Phase 1)."

@@ -320,11 +320,10 @@ def _sp_vision_attention_forward(
     # Step 4: AllToAll & Matmul (o_proj)
     #   strategy: all_to_all(context, scatter=seq, gather=head)
     #             -> [local_seq, 1, all_h*head_dim]
-    #             then split by head -> [local_seq, 1, local_h*head_dim]
-    #             then quant_method.apply(proj_layer, local_input, bias)
-    #             -> [local_seq, 1, hidden] (partial)
-    #             then all_reduce -> [local_seq, 1, hidden] (full)
-    output = strategy.alltoall_matmul_reduce(context_layer, self.proj)
+    #             then AllGather o_proj weight shards -> [H, all_h*head_dim] (cached)
+    #             then F.linear(full_input, full_weight, bias)
+    #             -> [local_seq, 1, hidden] (full, no AllReduce needed)
+    output = strategy.alltoall_matmul(context_layer, self.proj)
     return output
 
 
