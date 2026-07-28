@@ -29,7 +29,6 @@ strategy interface) because no fused version is planned for ReduceScatter.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from abc import ABC, abstractmethod
 
 from vllm.distributed import (
@@ -37,38 +36,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
-
-
-_full_weight_cache: dict[int, torch.Tensor] = {}
-
-
-def clear_full_weight_cache() -> None:
-    """Clear cached AllGathered o_proj weights.
-
-    Must be called after weight updates (e.g., RL weight transfer) to
-    invalidate stale cached full weights.
-    """
-    _full_weight_cache.clear()
-
-
-def _get_full_weight(layer) -> torch.Tensor:
-    """AllGather row-parallel weight shards to form the full o_proj weight.
-
-    Each rank holds [H, local_h*d]; AllGather along dim=-1 yields [H, N*d].
-    The result is cached per-layer for the lifetime of the process (inference
-    weights are immutable). Call clear_full_weight_cache() after weight updates.
-
-    NOTE: This bypasses ``quant_method.apply`` and uses ``F.linear`` directly.
-    This is correct for unquantized layers (the common case for ViT o_proj).
-    For quantized ViT layers, this would need to be extended.
-    """
-    key = id(layer)
-    cached = _full_weight_cache.get(key)
-    if cached is not None:
-        return cached
-    full_weight = tensor_model_parallel_all_gather(layer.weight, dim=-1)
-    _full_weight_cache[key] = full_weight
-    return full_weight
 
 
 class VisionSPStrategy(ABC):
@@ -103,15 +70,16 @@ class VisionSPStrategy(ABC):
     def alltoall_matmul(
         self, input_: torch.Tensor, layer
     ) -> torch.Tensor:
-        """AllToAll(seq->head) + full matmul with AllGathered weight.
+        """AllToAll(seq->head) + full matmul with ReplicatedLinear weight.
 
         Used for o_proj (proj). After AllToAll each rank holds all heads
-        for its local_seq. The o_proj weight shards are AllGathered (cached)
-        so each rank can compute the full output without AllReduce.
+        for its local_seq. The o_proj is a ReplicatedLinear (full weight
+        [H, all_h*head_dim] on every rank), so each rank can compute the
+        full output without AllReduce.
 
         Args:
             input_: [full_seq, ..., local_h*head_dim]  (FA output)
-            layer:  RowParallelLinear (weight is AllGathered at runtime)
+            layer:  ReplicatedLinear (full weight on every rank)
         Returns:
             [local_seq, ..., hidden]
         """
@@ -168,14 +136,11 @@ class NaiveVisionSPStrategy(VisionSPStrategy):
         # 1. AllToAll: scatter seq (dim=0), gather head (dim=-1)
         #    [full_seq, ..., local_h*head_dim] -> [local_seq, ..., all_h*head_dim]
         gathered = tp_group.all_to_all(input_, scatter_dim=0, gather_dim=-1)
-        # 2. AllGather o_proj weight shards -> full weight [H, all_h*head_dim]
-        #    (cached per-layer; each rank holds [H, local_h*head_dim])
-        full_weight = _get_full_weight(layer)
-        # 3. Full matmul: all heads' contributions are summed in one matmul.
+        # 2. Full matmul with ReplicatedLinear weight [H, all_h*head_dim].
         #    No AllReduce needed — each rank already has all heads for its
-        #    local_seq after AllToAll.
+        #    local_seq after AllToAll, and the weight is replicated.
         bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
-        output = F.linear(gathered, full_weight, bias)
+        output = layer.quant_method.apply(layer, gathered, bias)
         return output
 
 
@@ -203,7 +168,6 @@ def clear_vision_sp_strategy():
     """Reset the strategy singleton. Called from clear_enable_sp()."""
     global _strategy_instance
     _strategy_instance = None
-    clear_full_weight_cache()
 
 
 class FusedVisionSPStrategy(VisionSPStrategy):
