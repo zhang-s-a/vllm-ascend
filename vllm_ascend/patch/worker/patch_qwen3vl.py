@@ -7,6 +7,7 @@ from vllm.distributed import (
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeAttention
 from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionAttention
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionMLP,
     Qwen3_VisionTransformer,
@@ -320,9 +321,9 @@ def _sp_vision_attention_forward(
     # Step 4: AllToAll & Matmul (o_proj)
     #   strategy: all_to_all(context, scatter=seq, gather=head)
     #             -> [local_seq, 1, all_h*head_dim]
-    #             then AllGather o_proj weight shards -> [H, all_h*head_dim] (cached)
-    #             then F.linear(full_input, full_weight, bias)
+    #             then quant_method.apply(proj, gathered, bias)
     #             -> [local_seq, 1, hidden] (full, no AllReduce needed)
+    #   o_proj is ReplicatedLinear when SP is enabled (full weight on every rank)
     output = strategy.alltoall_matmul(context_layer, self.proj)
     return output
 
@@ -380,3 +381,45 @@ def _vision_transformer_forward_wrapper(self, *args, **kwargs):
 Qwen2_5_VisionAttention.forward = _vision_attention_forward_wrapper
 Qwen3_VisionMLP.forward = _vision_mlp_forward_wrapper
 Qwen3_VisionTransformer.forward = _vision_transformer_forward_wrapper
+
+
+# ---------------------------------------------------------------------------
+# Path A: Replace o_proj with ReplicatedLinear when SP is enabled
+# ---------------------------------------------------------------------------
+# When vision SP is enabled, o_proj must use a full (replicated) weight
+# [H, N*head_dim] on every rank so that after AllToAll each rank can compute
+# the complete output for its local_seq without AllReduce. ReplicatedLinear's
+# weight_loader loads the checkpoint weight without TP sharding, so every rank
+# naturally receives the full weight at load time -- no runtime AllGather
+# needed.
+#
+# When SP is NOT enabled, o_proj stays RowParallelLinear (original behavior).
+# enable_vision_sp() is determined by config and stable throughout inference;
+# it is only reset by clear_enable_sp() during startup reinit (before model
+# construction), so the layer type is always consistent with the runtime flag.
+# ---------------------------------------------------------------------------
+
+_orig_vision_attn_init = Qwen2_5_VisionAttention.__init__
+
+
+def _patched_vision_attn_init(self, *args, **kwargs):
+    _orig_vision_attn_init(self, *args, **kwargs)
+    if enable_vision_sp():
+        tp_size = get_tensor_model_parallel_world_size()
+        orig_proj = self.proj
+        output_size = orig_proj.weight.shape[0]
+        input_size = orig_proj.weight.shape[1] * tp_size
+        has_bias = orig_proj.bias is not None
+        if not isinstance(orig_proj.quant_method, UnquantizedLinearMethod):
+            raise NotImplementedError(
+                "ReplicatedLinear o_proj with quantized ViT is not yet "
+                "supported. Please disable vision SP or use unquantized ViT."
+            )
+        self.proj = ReplicatedLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=has_bias,
+        )
+
+
+Qwen2_5_VisionAttention.__init__ = _patched_vision_attn_init
