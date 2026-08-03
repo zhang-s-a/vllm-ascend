@@ -95,6 +95,12 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_VISION_SP_FUSED",
             ascend_envs.VLLM_ASCEND_ENABLE_VISION_SP_FUSED,
         )
+        self.enable_vision_ulysses_sp = self._get_config_value(
+            additional_config,
+            "enable_vision_ulysses_sp",
+            "VLLM_ASCEND_ENABLE_VISION_ULYSSES_SP",
+            ascend_envs.VLLM_ASCEND_ENABLE_VISION_ULYSSES_SP,
+        )
         if self.scheduler_config.profiling_chunk_config.enabled and self.scheduler_config.enable_balance_scheduling:
             raise ValueError(
                 "profiling_chunk_config and balance scheduling (enable_balance_scheduling) "

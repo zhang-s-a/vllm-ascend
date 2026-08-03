@@ -70,6 +70,7 @@ _IS_VL_MODEL = None
 _ENABLE_SP = None
 _ENABLE_VISION_SP = None
 _ENABLE_VISION_SP_FUSED = None
+_ENABLE_VISION_ULYSSES_SP = None
 _HAS_LAYER_IDX = None
 _HAS_ROPE = None
 _ATNN_CALCULATION_STREAM = None
@@ -136,10 +137,11 @@ def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> 
 
 
 def clear_enable_sp():
-    global _ENABLE_SP, _ENABLE_VISION_SP, _ENABLE_VISION_SP_FUSED
+    global _ENABLE_SP, _ENABLE_VISION_SP, _ENABLE_VISION_SP_FUSED, _ENABLE_VISION_ULYSSES_SP
     _ENABLE_SP = None
     _ENABLE_VISION_SP = None
     _ENABLE_VISION_SP_FUSED = None
+    _ENABLE_VISION_ULYSSES_SP = None
     enable_dsa_cp.cache_clear()
     enable_dsa_cp_with_o_proj_tp.cache_clear()
     _libc_getenv.cache_clear()
@@ -966,6 +968,41 @@ def enable_vision_sp_fused() -> bool:
         except RuntimeError:
             _ENABLE_VISION_SP_FUSED = envs_ascend.VLLM_ASCEND_ENABLE_VISION_SP_FUSED
     return bool(_ENABLE_VISION_SP_FUSED)
+
+
+def enable_vision_ulysses_sp(vllm_config=None) -> bool:
+    """Check if Ulysses SP is enabled for ViT attention.
+
+    When enabled, qkv uses AllToAll(head->seq) instead of AllGather(seq),
+    giving better communication efficiency at tp>=4.
+    Only meaningful when enable_vision_sp() is also True.
+    """
+    global _ENABLE_VISION_ULYSSES_SP
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except AssertionError:
+            vllm_config = None
+
+    additional_config = (
+        getattr(vllm_config, "additional_config", None)
+        if vllm_config is not None
+        else None
+    )
+    refresh = additional_config.get("refresh", False) if additional_config else False
+
+    if _ENABLE_VISION_ULYSSES_SP is None or refresh:
+        if additional_config is not None and "enable_vision_ulysses_sp" in additional_config:
+            _ENABLE_VISION_ULYSSES_SP = bool(additional_config["enable_vision_ulysses_sp"])
+        else:
+            try:
+                _ENABLE_VISION_ULYSSES_SP = get_ascend_config().enable_vision_ulysses_sp
+            except RuntimeError:
+                _ENABLE_VISION_ULYSSES_SP = envs_ascend.VLLM_ASCEND_ENABLE_VISION_ULYSSES_SP
+
+    return bool(_ENABLE_VISION_ULYSSES_SP)
 
 
 # TODO remove it after vllm has this func

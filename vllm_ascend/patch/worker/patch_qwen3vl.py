@@ -17,7 +17,7 @@ from vllm.model_executor.models.qwen3_vl import (
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
-from vllm_ascend.utils import enable_vision_sp
+from vllm_ascend.utils import enable_vision_sp, enable_vision_ulysses_sp
 
 
 def tensor_parallel_wrap(func):
@@ -328,7 +328,108 @@ def _sp_vision_attention_forward(
     return output
 
 
-def _sp_vision_mlp_forward(self, x):
+def _ulysses_vision_attention_forward(
+    self,
+    x,
+    cu_seqlens,
+    rotary_pos_emb_cos,
+    rotary_pos_emb_sin,
+    max_seqlen,
+    sequence_lengths,
+):
+    """Ulysses SP-mode VisionAttention.forward.
+
+    Compared to TPSP (_sp_vision_attention_forward), the difference is in
+    the qkv path: instead of AllGather(seq)+qkv(col-parallel), it does
+    qkv(replicated)+AllToAll(head->seq). This reduces communication from
+    O(tp) to O(1) for the first communication, beneficial at tp>=4.
+
+    Flow:
+        x [local_seq] -> qkv(replicated) -> rearrange(head outer)
+        -> AllToAll(head->seq) -> rearrange back -> RoPE -> FIA
+        -> AllToAll(seq->head) -> o_proj(replicated) -> [local_seq]
+    """
+    import einops
+    from vllm.distributed import get_tp_group
+
+    from vllm_ascend.ops.vision_sp_strategy import get_vision_sp_strategy
+
+    strategy = get_vision_sp_strategy()
+    tp_group = get_tp_group()
+
+    # x: [local_seq, 1, hidden] (SP sharded on dim=0)
+
+    # Step 1: qkv (ReplicatedLinear, full weight [H, 3*N*d])
+    #   [L, 1, H] -> [L, 1, 3*N*d]  (local_seq, all heads)
+    bias = self.qkv.bias if not getattr(self.qkv, "skip_bias_add", False) else None
+    qkv_out = self.qkv.quant_method.apply(self.qkv, x, bias)
+
+    # Step 2: Rearrange so head is the outer dim (for correct AllToAll split).
+    #   Raw qkv layout is (three, head, head_dim) flattened as 3*N*d.
+    #   AllToAll on the raw layout would split across q/k/v boundaries.
+    #   Reorder to (head, three, head_dim) so AllToAll splits by head.
+    #   [L, 1, 3*N*d] -> [L, 1, N*(3*d)]
+    qkv_head_outer = einops.rearrange(
+        qkv_out,
+        "s b (three head head_dim) -> s b (head three head_dim)",
+        three=3,
+        head_dim=self.hidden_size_per_attention_head,
+    )
+
+    # Step 3: AllToAll (head->seq): scatter_dim=-1, gather_dim=0
+    #   [L, 1, N*(3*d)] -> [S', 1, local_h*(3*d)]  (full_seq, local heads)
+    gathered = tp_group.all_to_all(qkv_head_outer, scatter_dim=-1, gather_dim=0)
+
+    # Step 4: Rearrange back to [batch, seq, three, local_h, head_dim]
+    #   [S', 1, local_h*(3*d)] -> [1, S', 3, local_h, d]
+    qkv = einops.rearrange(
+        gathered,
+        "s b (head three head_dim) -> b s three head head_dim",
+        three=3,
+        head_dim=self.hidden_size_per_attention_head,
+    )
+
+    seq_len, batch_size = qkv.shape[1], qkv.shape[0]
+
+    # Step 5: RoPE (same as TPSP — cos/sin are full versions)
+    if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+        qk, v = qkv[:, :, :2], qkv[:, :, 2]
+        qk_reshaped = einops.rearrange(
+            qk, "b s two head head_dim -> (two b) s head head_dim", two=2
+        )
+        qk_reshaped = qk_reshaped.contiguous()
+        qk_rotated = self.apply_rotary_emb(
+            qk_reshaped, rotary_pos_emb_cos, rotary_pos_emb_sin
+        )
+        qk_rotated = qk_rotated.view(
+            2,
+            batch_size,
+            seq_len,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        q, k = qk_rotated.unbind(dim=0)
+    else:
+        q, k, v = qkv.unbind(dim=2)
+
+    # Step 6: FIA (same as TPSP — local_h heads, full_seq)
+    context_layer = self.attn(
+        query=q,
+        key=k,
+        value=v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        sequence_lengths=sequence_lengths,
+    )
+    context_layer = einops.rearrange(
+        context_layer, "b s h d -> s b (h d)", b=batch_size
+    ).contiguous()
+    # [full_seq, 1, local_h*head_dim]
+
+    # Step 7: AllToAll(seq->head) + o_proj (same as TPSP)
+    #   o_proj is ReplicatedLinear (full weight on every rank)
+    output = strategy.alltoall_matmul(context_layer, self.proj)
+    return output
     """SP-mode VisionMLP.forward (AllGather/ReduceScatter SP for MLP).
 
     Original flow (TP-only, qwen3_vl.py:408-410):
@@ -361,6 +462,8 @@ def _sp_vision_mlp_forward(self, x):
 
 def _vision_attention_forward_wrapper(self, *args, **kwargs):
     if enable_vision_sp():
+        if enable_vision_ulysses_sp():
+            return _ulysses_vision_attention_forward(self, *args, **kwargs)
         return _sp_vision_attention_forward(self, *args, **kwargs)
     return _orig_vision_attention_forward(self, *args, **kwargs)
 
@@ -406,20 +509,44 @@ def _patched_vision_attn_init(self, *args, **kwargs):
     _orig_vision_attn_init(self, *args, **kwargs)
     if enable_vision_sp():
         tp_size = get_tensor_model_parallel_world_size()
+
+        # --- o_proj: always replace with ReplicatedLinear when SP is enabled ---
+        # After AllToAll(seq->head), each rank has all heads for its local_seq.
+        # ReplicatedLinear's full weight [H, N*d] allows one matmul without AllReduce.
         orig_proj = self.proj
-        output_size = orig_proj.weight.shape[0]
-        input_size = orig_proj.weight.shape[1] * tp_size
-        has_bias = orig_proj.bias is not None
+        proj_output_size = orig_proj.weight.shape[0]
+        proj_input_size = orig_proj.weight.shape[1] * tp_size
+        proj_has_bias = orig_proj.bias is not None
         if not isinstance(orig_proj.quant_method, UnquantizedLinearMethod):
             raise NotImplementedError(
                 "ReplicatedLinear o_proj with quantized ViT is not yet "
                 "supported. Please disable vision SP or use unquantized ViT."
             )
         self.proj = ReplicatedLinear(
-            input_size=input_size,
-            output_size=output_size,
-            bias=has_bias,
+            input_size=proj_input_size,
+            output_size=proj_output_size,
+            bias=proj_has_bias,
         )
+
+        # --- qkv: additionally replace with ReplicatedLinear for Ulysses SP ---
+        # Ulysses SP does qkv BEFORE AllToAll(head->seq), so qkv must compute
+        # all heads (full weight [H, 3*N*d]) on the local_seq input.
+        # TPSP does qkv AFTER AllGather(seq), so it keeps column-parallel qkv.
+        if enable_vision_ulysses_sp():
+            orig_qkv = self.qkv
+            qkv_input_size = orig_qkv.weight.shape[0]
+            qkv_output_size = orig_qkv.weight.shape[1] * tp_size
+            qkv_has_bias = orig_qkv.bias is not None
+            if not isinstance(orig_qkv.quant_method, UnquantizedLinearMethod):
+                raise NotImplementedError(
+                    "ReplicatedLinear qkv with quantized ViT is not yet "
+                    "supported. Please disable Ulysses SP or use unquantized ViT."
+                )
+            self.qkv = ReplicatedLinear(
+                input_size=qkv_input_size,
+                output_size=qkv_output_size,
+                bias=qkv_has_bias,
+            )
 
 
 Qwen2_5_VisionAttention.__init__ = _patched_vision_attn_init
