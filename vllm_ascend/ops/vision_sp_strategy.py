@@ -28,14 +28,16 @@ strategy interface) because no fused version is planned for ReduceScatter.
 
 from __future__ import annotations
 
-import torch
 from abc import ABC, abstractmethod
 
+import torch
+import torch_npu
 from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 
 class VisionSPStrategy(ABC):
@@ -186,10 +188,35 @@ class FusedVisionSPStrategy(VisionSPStrategy):
     """
 
     def allgather_and_matmul(self, input_, layer):
-        raise NotImplementedError(
-            "FusedVisionSPStrategy is Phase 2. Set VLLM_ASCEND_ENABLE_VISION_SP_FUSED=0"
-            " to use NaiveVisionSPStrategy (Phase 1)."
+        if not isinstance(layer.quant_method, UnquantizedLinearMethod):
+            full_input = tensor_model_parallel_all_gather(input_, dim=0)
+            bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
+            return layer.quant_method.apply(layer, full_input, bias)
+
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group
+        tp_size = tp_group.world_size
+
+        k = input_.shape[-1]
+        x1 = input_.reshape(-1, k)
+        x2 = layer.weight.t()
+        hcom_name = tp_group.device_group._get_backend(torch.device("npu")).get_hccl_comm_name(tp_rank)
+
+        output, _ = torch_npu.npu_all_gather_base_mm(
+            x1,
+            x2,
+            hcom_name,
+            tp_size,
+            bias=None,
+            comm_turn=0,
+            comm_mode="aiv",
         )
+        output = output.reshape(-1, *input_.shape[1:-1], output.shape[-1])
+
+        bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
+        if bias is not None:
+            output = output + bias
+        return output
 
     def alltoall_matmul(self, input_, layer):
         raise NotImplementedError(
