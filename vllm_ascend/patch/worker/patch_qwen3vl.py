@@ -534,8 +534,11 @@ def _patched_vision_attn_init(self, *args, **kwargs):
         # TPSP does qkv AFTER AllGather(seq), so it keeps column-parallel qkv.
         if enable_vision_ulysses_sp():
             orig_qkv = self.qkv
-            qkv_input_size = orig_qkv.weight.shape[0]
-            qkv_output_size = orig_qkv.weight.shape[1] * tp_size
+            # QKVParallelLinear (column-parallel) weight shape is
+            # [output_per_partition, input] = [3*local_h*d, H].
+            # Full output = 3*local_h*d * tp = 3*N*d; input = H (unchanged).
+            qkv_input_size = orig_qkv.weight.shape[1]
+            qkv_output_size = orig_qkv.weight.shape[0] * tp_size
             qkv_has_bias = orig_qkv.bias is not None
             if not isinstance(orig_qkv.quant_method, UnquantizedLinearMethod):
                 raise NotImplementedError(
