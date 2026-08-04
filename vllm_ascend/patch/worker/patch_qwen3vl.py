@@ -430,6 +430,9 @@ def _ulysses_vision_attention_forward(
     #   o_proj is ReplicatedLinear (full weight on every rank)
     output = strategy.alltoall_matmul(context_layer, self.proj)
     return output
+
+
+def _sp_vision_mlp_forward(self, x):
     """SP-mode VisionMLP.forward (AllGather/ReduceScatter SP for MLP).
 
     Original flow (TP-only, qwen3_vl.py:408-410):
