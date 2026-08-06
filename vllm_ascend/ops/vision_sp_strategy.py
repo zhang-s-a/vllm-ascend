@@ -219,15 +219,6 @@ class FusedVisionSPStrategy(VisionSPStrategy):
         return output
 
     def alltoall_matmul(self, input_, layer):
-        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-        is_a3 = get_ascend_device_type() == AscendDeviceType.A3
-        if not is_a3 or not isinstance(layer.quant_method, UnquantizedLinearMethod):
-            tp_group = get_tp_group()
-            gathered = tp_group.all_to_all(input_, scatter_dim=0, gather_dim=-1)
-            bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
-            return layer.quant_method.apply(layer, gathered, bias)
-
         tp_group = get_tp_group()
         tp_rank = tp_group.rank_in_group
         tp_size = tp_group.world_size
