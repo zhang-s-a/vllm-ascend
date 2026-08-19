@@ -114,6 +114,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_VISION_SP_FUSED": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_VISION_SP_FUSED", "0"))
     ),
+    # Whether to use Ulysses SP for ViT attention (AllToAll-based qkv instead
+    # of AllGather). Requires enable_vision_sp=True. Better communication
+    # efficiency at tp>=4. Default: 0 (use TPSP AllGather-based qkv).
+    "VLLM_ASCEND_ENABLE_VISION_ULYSSES_SP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_VISION_ULYSSES_SP", "0"))
+    ),
 }
 
 # end-env-vars-definition
