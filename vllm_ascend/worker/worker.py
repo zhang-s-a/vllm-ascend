@@ -45,6 +45,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.timing_trace import timing_span
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -601,6 +602,26 @@ class NPUWorker(WorkerBase):
         )
 
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        request_ids = ",".join(scheduler_output.num_scheduled_tokens.keys())
+        phase = (
+            "prefill"
+            if scheduler_output.scheduled_new_reqs
+            or scheduler_output.scheduled_encoder_inputs
+            else "decode"
+        )
+        with timing_span(
+            "worker.execute_total",
+            request_id=request_ids,
+            phase=phase,
+            scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        ):
+            output = self._execute_model(scheduler_output)
+        return output
+
+    def _execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

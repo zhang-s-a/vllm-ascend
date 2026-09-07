@@ -51,6 +51,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler
+from vllm.utils.timing_trace import (
+    timing_span,
+    timing_trace_enabled,
+    trace_event,
+)
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -761,7 +766,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
+        first_npu_ts_ns = None
+        if getattr(self, "_timing_phase", "unknown") == "prefill":
+            first_npu_ts_ns = time.time_ns()
         self.input_batch.block_table.commit_block_table(num_reqs)
+        if first_npu_ts_ns is not None:
+            trace_event(
+                "worker.first_npu_op",
+                request_id=getattr(self, "_timing_request_ids", "-"),
+                ts_ns=first_npu_ts_ns,
+                op="block_table.commit_block_table",
+                expected_profiler_op="MEMCPY_ASYNC",
+                boundary="immediately_before_submission",
+            )
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -1426,9 +1443,15 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         try:
-            return super()._preprocess(
-                scheduler_output, num_input_tokens, intermediate_tensors
-            )
+            with timing_span(
+                "worker.preprocess",
+                request_id=getattr(self, "_timing_request_ids", "-"),
+                phase=getattr(self, "_timing_phase", "unknown"),
+                num_input_tokens=num_input_tokens,
+            ):
+                return super()._preprocess(
+                    scheduler_output, num_input_tokens, intermediate_tensors
+                )
         finally:
             if (
                 self.pcp_size > 1
@@ -1439,6 +1462,26 @@ class NPUModelRunner(GPUModelRunner):
                 self.pcp_manager.restore_scheduler_output_after_mm_preprocess(
                     scheduler_output, restore_state
                 )
+
+    def _execute_mm_encoder(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[torch.Tensor]:
+        num_items = sum(map(len, scheduler_output.scheduled_encoder_inputs.values()))
+        if not num_items:
+            return super()._execute_mm_encoder(scheduler_output)
+        with (
+            timing_span(
+                "worker.vit_total",
+                request_id=getattr(self, "_timing_request_ids", "-"),
+                sync_device=True,
+                phase=getattr(self, "_timing_phase", "unknown"),
+                items=num_items,
+            ),
+            torch.profiler.record_function("timing_trace::vit_total")
+            if timing_trace_enabled()
+            else nullcontext(),
+        ):
+            return super()._execute_mm_encoder(scheduler_output)
 
     def _gather_mm_embeddings(
         self,
@@ -1902,6 +1945,16 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._timing_request_ids = ",".join(
+            scheduler_output.num_scheduled_tokens.keys()
+        )
+        self._timing_phase = (
+            "prefill"
+            if scheduler_output.scheduled_new_reqs
+            or scheduler_output.scheduled_encoder_inputs
+            else "decode"
+        )
+        trace_event("worker.execute_begin", request_id=self._timing_request_ids, phase=self._timing_phase)
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2742,17 +2795,29 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
-        if self.enable_enpu:
-            # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
-            hidden_states = run_model()
-        else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
+        with (
+            timing_span(
+                "worker.llm",
+                request_id=getattr(self, "_timing_request_ids", "-"),
+                sync_device=getattr(self, "_timing_phase", "unknown") == "prefill",
+                phase=getattr(self, "_timing_phase", "unknown"),
+                num_tokens=num_tokens_padded,
+            ),
+            torch.profiler.record_function("timing_trace::llm")
+            if timing_trace_enabled()
+            else nullcontext(),
+        ):
+            if self.enable_enpu:
+                # Soft segmentation requires event.record before event.wait.
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
+                hidden_states = run_model()
+            else:
+                hidden_states = run_model()
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
